@@ -3,3 +3,5 @@ __pycache__/
 outputs/
 models/
 HiNER-main/
+HGN/
+CHIP-STS/

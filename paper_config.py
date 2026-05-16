@@ -8,6 +8,71 @@ PAPER_META = {
 }
 
 
+# 当前活动数据集。
+# 这里只允许通过改配置切换，不强制再加命令行入口，避免把主线搞复杂。
+ACTIVE_DATASET = "CMeEE-V2"
+
+
+# 所有数据集配置统一在这里注册，训练/预测都只认这一份真相。
+DATASET_CONFIGS = {
+    "CMeEE-V2": {
+        "dataset_name": "CMeEE-V2",
+        "task_type": "ner",
+        "train_path": "./CMeEE-V2/CMeEE-V2_train.json",
+        "eval_path": "./CMeEE-V2/CMeEE-V2_dev.json",
+        "test_path": "./CMeEE-V2/CMeEE-V2_test.json",
+        "label_list": ["bod", "dis", "sym", "mic", "pro", "ite", "dep", "dru", "equ"],
+        "input_format": "cmeee_json",
+        "predict_output_format": "cmeee_entities",
+    },
+    "IMCS-V2-NER": {
+        "dataset_name": "IMCS-V2-NER",
+        "task_type": "ner",
+        "train_path": "./IMCS-V2-NER/IMCS-V2_train.json",
+        "eval_path": "./IMCS-V2-NER/IMCS-V2_dev.json",
+        "test_path": "./IMCS-V2-NER/IMCS-V2_test.json",
+        "label_list": ["Symptom", "Drug", "Drug_Category", "Medical_Examination", "Operation"],
+        "input_format": "imcs_dialogue_bio",
+        "predict_output_format": "imcs_bio_dict",
+    },
+}
+
+
+def get_dataset_config(dataset_name):
+    """按名称返回数据集配置。"""
+    if dataset_name not in DATASET_CONFIGS:
+        raise ValueError(
+            f"未知数据集：{dataset_name}。当前可选数据集为：{', '.join(DATASET_CONFIGS.keys())}"
+        )
+    return DATASET_CONFIGS[dataset_name]
+
+
+def get_active_dataset_config():
+    """返回当前活动数据集配置。"""
+    return get_dataset_config(ACTIVE_DATASET)
+
+
+def ensure_dataset_supports_ner(dataset_config):
+    """确保当前活动数据集真的是 NER 任务。"""
+    if dataset_config["task_type"] != "ner":
+        raise ValueError(
+            f"当前活动数据集 {dataset_config['dataset_name']} 不是 NER，而是 {dataset_config['task_type']} 任务。"
+            "本项目当前只支持 NER 数据集切换。"
+        )
+    return dataset_config
+
+
+def build_label_mappings(dataset_config):
+    """根据数据集标签列表动态构建标签映射。"""
+    ent2id = {label: index for index, label in enumerate(dataset_config["label_list"])}
+    id2ent = {index: label for label, index in ent2id.items()}
+    return ent2id, id2ent
+
+
+# 下面这些是当前复现实验的统一默认设置。
+ACTIVE_DATASET_CONFIG = get_active_dataset_config()
+
+
 PAPER_EXPLICIT_SETTINGS = {
     # 下面这些是论文正文里明确写出来的设置
     # 预训练模型路径；当前使用本地 MacBERT-base 中文权重。
@@ -17,6 +82,7 @@ PAPER_EXPLICIT_SETTINGS = {
     # K 折数量；论文口径默认 5 折。
     "num_folds": 5,
 }
+
 
 REPRO_DEFAULTS = {
     # 下面这些数值型超参数，论文正文没有公开写死
@@ -78,4 +144,3 @@ REPRO_DEFAULTS = {
     # 全局随机种子，用于 random/numpy/torch 复现。
     "seed": 42,
 }
- 

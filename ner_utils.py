@@ -4,8 +4,6 @@ from collections import Counter, defaultdict
 import numpy as np
 import torch
 
-from data_loader import id2ent
-
 
 def sample_fewshot_data(data, ratio, seed):
     '''从数据列表中随机采样指定比例的数据，保持原有顺序不变。'''
@@ -34,7 +32,7 @@ def build_entity_frequency(data):
     return frequency
 
 
-def decode_entities_from_labels(labels, raw_text_list, offset_mappings):
+def decode_entities_from_labels(labels, raw_text_list, offset_mappings, id2ent):
     """
     从真实标签张量中解码出实体标注（用于评估时构造 gold 标准）。
 
@@ -71,7 +69,7 @@ def decode_entities_from_labels(labels, raw_text_list, offset_mappings):
     return decoded
 
 
-def decode_entities_from_logits(logits, raw_text_list, offset_mappings, threshold):
+def decode_entities_from_logits(logits, raw_text_list, offset_mappings, threshold, id2ent):
     """
     从模型推理输出的 logits 中解码出实体预测结果。
 

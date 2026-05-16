@@ -3,13 +3,19 @@ import os
 import json
 import argparse
 
+import numpy as np
 import torch
 from tqdm import tqdm
 from transformers import BertModel, BertTokenizerFast
 
-from data_loader import ent2id
-from ner_utils import decode_entities_from_logits
-from paper_config import PAPER_EXPLICIT_SETTINGS, REPRO_DEFAULTS
+from paper_config import (
+    ACTIVE_DATASET,
+    ACTIVE_DATASET_CONFIG,
+    PAPER_EXPLICIT_SETTINGS,
+    REPRO_DEFAULTS,
+    build_label_mappings,
+    ensure_dataset_supports_ner,
+)
 from TModel import GlobalPointer
 
 
@@ -17,7 +23,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="边界感知 GlobalPointer 推理脚本")
     parser.add_argument("--model_path", default=PAPER_EXPLICIT_SETTINGS["model_path"], help="预训练模型目录，或 HuggingFace 模型名")
     parser.add_argument("--checkpoint_path", default="./outputs/ent_model.pth", help="训练好的模型权重")
-    parser.add_argument("--test_path", default=r"./CMeEE-V2/CMeEE-V2_test.json", help="待预测数据路径")
+    parser.add_argument("--test_path", default=ACTIVE_DATASET_CONFIG["test_path"], help="待预测数据路径")
     parser.add_argument("--output_path", default="./outputs/predict.json", help="预测结果输出路径")
     parser.add_argument("--max_len", type=int, default=REPRO_DEFAULTS["max_len"], help="最大长度")
     parser.add_argument("--hidden_size", type=int, default=REPRO_DEFAULTS["hidden_size"], help="隐藏层维度")
@@ -38,7 +44,7 @@ def build_device(device_name):
     return torch.device(device_name)
 
 
-def build_model(args, device):
+def build_model(args, device, ent2id):
     tokenizer = BertTokenizerFast.from_pretrained(args.model_path)
     encoder = BertModel.from_pretrained(args.model_path, use_safetensors=False)
     model = GlobalPointer(
@@ -58,7 +64,8 @@ def build_model(args, device):
     return tokenizer, model
 
 
-def ner_predict(text, tokenizer, ner_model, device, args):
+def encode_text(text, tokenizer, device, args):
+    """对单句文本做编码，并保留 offset_mapping 方便 span 回译。"""
     encoded = tokenizer(
         text,
         return_offsets_mapping=True,
@@ -70,9 +77,16 @@ def ner_predict(text, tokenizer, ner_model, device, args):
         for span in encoded["offset_mapping"]
     ]
     input_ids = torch.tensor(encoded["input_ids"]).long().unsqueeze(0).to(device)
-    token_type_ids = torch.tensor(encoded.get("token_type_ids", [0] * len(encoded["input_ids"]))).long().unsqueeze(0).to(device)
+    token_type_ids = torch.tensor(
+        encoded.get("token_type_ids", [0] * len(encoded["input_ids"]))
+    ).long().unsqueeze(0).to(device)
     attention_mask = torch.tensor(encoded["attention_mask"]).float().unsqueeze(0).to(device)
+    return input_ids, token_type_ids, attention_mask, offset_mapping
 
+
+def predict_spans(text, tokenizer, ner_model, device, args, id2ent):
+    """返回单句文本的原始 span 预测结果，并保留分数供后处理使用。"""
+    input_ids, token_type_ids, attention_mask, offset_mapping = encode_text(text, tokenizer, device, args)
     with torch.no_grad():
         outputs = ner_model(
             input_ids,
@@ -80,35 +94,141 @@ def ner_predict(text, tokenizer, ner_model, device, args):
             token_type_ids,
         )
 
-    entities = decode_entities_from_logits(outputs["logits"], [text], [offset_mapping], args.prediction_threshold)[0]
+    scores = outputs["logits"][0].detach().cpu().numpy()
+    entities = []
+    for label_id, token_start, token_end in zip(*np.where(scores > args.prediction_threshold)):
+        if token_start >= len(offset_mapping) or token_end >= len(offset_mapping):
+            continue
+        start_span = offset_mapping[token_start]
+        end_span = offset_mapping[token_end]
+        if not start_span or not end_span or start_span == (0, 0) or end_span == (0, 0):
+            continue
+        start_char = start_span[0]
+        end_char = end_span[1] - 1
+        if start_char > end_char or end_char >= len(text):
+            continue
+        entities.append(
+            {
+                "type": id2ent[label_id],
+                "start_idx": start_char,
+                "end_idx": end_char,
+                "text": text[start_char:end_char + 1],
+                "score": float(scores[label_id, token_start, token_end]),
+            }
+        )
+    return entities
+
+
+def build_cmeee_result(text, entities):
+    """把预测 span 组装成 CMeEE 提交格式。"""
     return {
         "text": text,
         "entities": [
             {
-                "start_idx": start_index,
-                "end_idx": end_index,
-                "type": label,
+                "start_idx": entity["start_idx"],
+                "end_idx": entity["end_idx"],
+                "type": entity["type"],
             }
-            for label, start_index, end_index, _ in entities
+            for entity in entities
         ],
     }
 
 
+def select_non_overlapping_entities(entities):
+    """按分数从高到低贪心保留不重叠实体。
+
+    IMCS 的提交格式是一条 BIO 序列，天然不允许重叠。
+    这里固定采用我们事先约定的策略，避免引入额外开关。
+    """
+    sorted_entities = sorted(
+        entities,
+        key=lambda item: (-item["score"], item["start_idx"], item["end_idx"]),
+    )
+    selected_entities = []
+    occupied_positions = set()
+    for entity in sorted_entities:
+        entity_positions = set(range(entity["start_idx"], entity["end_idx"] + 1))
+        if entity_positions & occupied_positions:
+            continue
+        selected_entities.append(entity)
+        occupied_positions.update(entity_positions)
+    return sorted(selected_entities, key=lambda item: (item["start_idx"], item["end_idx"]))
+
+
+def convert_entities_to_bio(text, entities):
+    """把不重叠 span 转成字符级 BIO 序列。"""
+    bio_labels = ["O"] * len(text)
+    for entity in entities:
+        start_index = entity["start_idx"]
+        end_index = entity["end_idx"]
+        entity_type = entity["type"]
+        bio_labels[start_index] = f"B-{entity_type}"
+        for index in range(start_index + 1, end_index + 1):
+            bio_labels[index] = f"I-{entity_type}"
+    return " ".join(bio_labels)
+
+
+def predict_cmeee(test_data, tokenizer, model, device, args, id2ent):
+    """按 CMeEE 的原提交格式输出。"""
+    results = []
+    for sample in tqdm(test_data):
+        text = sample["text"]
+        entities = predict_spans(text, tokenizer, model, device, args, id2ent)
+        results.append(build_cmeee_result(text, entities))
+    return results
+
+
+def predict_imcs(test_data, tokenizer, model, device, args, id2ent):
+    """按 IMCS-V2-NER 官方提交格式输出。
+
+    输出结构为：
+    {
+        "dialogue_id": {
+            "sentence_id": "BIO BIO BIO ..."
+        }
+    }
+    """
+    results = {}
+    for dialogue_id, dialogue_sample in tqdm(test_data.items()):
+        results[dialogue_id] = {}
+        for turn in dialogue_sample.get("dialogue", []):
+            sentence_id = str(turn["sentence_id"])
+            text = turn.get("sentence", "")
+            entities = predict_spans(text, tokenizer, model, device, args, id2ent)
+            entities = select_non_overlapping_entities(entities)
+            results[dialogue_id][sentence_id] = convert_entities_to_bio(text, entities)
+    return results
+
+
 def main():
     args = parse_args()
+    dataset_config = ensure_dataset_supports_ner(ACTIVE_DATASET_CONFIG)
+    ent2id, id2ent = build_label_mappings(dataset_config)
     device = build_device(args.device)
     output_dir = os.path.dirname(args.output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    tokenizer, model = build_model(args, device)
+    print(f"当前活动数据集：{ACTIVE_DATASET}")
+    print(f"当前数据集任务类型：{dataset_config['task_type']}")
+    print(f"当前预测输入：{args.test_path}")
+    print(f"当前预测输出格式：{dataset_config['predict_output_format']}")
+    print(f"当前标签数：{len(ent2id)}")
+
+    tokenizer, model = build_model(args, device, ent2id)
 
     with open(args.test_path, encoding="utf-8") as file:
         test_data = json.load(file)
 
-    results = []
-    for sample in tqdm(test_data):
-        results.append(ner_predict(sample["text"], tokenizer, model, device, args))
+    if dataset_config["predict_output_format"] == "cmeee_entities":
+        results = predict_cmeee(test_data, tokenizer, model, device, args, id2ent)
+    elif dataset_config["predict_output_format"] == "imcs_bio_dict":
+        results = predict_imcs(test_data, tokenizer, model, device, args, id2ent)
+    else:
+        raise ValueError(
+            f"当前活动数据集 {dataset_config['dataset_name']} 的预测输出格式 "
+            f"{dataset_config['predict_output_format']} 不受支持。"
+        )
 
     with open(args.output_path, "w", encoding="utf-8") as file:
         json.dump(results, file, indent=4, ensure_ascii=False)

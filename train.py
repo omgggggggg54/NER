@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import BertModel, BertTokenizerFast, get_linear_schedule_with_warmup
 
-from data_loader import EntDataset, ent2id, load_data
+from data_loader import EntDataset, load_data
 from ner_utils import (
     build_entity_frequency,
     create_metric_counter,
@@ -22,7 +22,15 @@ from ner_utils import (
     summarize_metric_counter,
     update_metric_counter,
 )
-from paper_config import PAPER_EXPLICIT_SETTINGS, PAPER_META, REPRO_DEFAULTS
+from paper_config import (
+    ACTIVE_DATASET,
+    ACTIVE_DATASET_CONFIG,
+    PAPER_EXPLICIT_SETTINGS,
+    PAPER_META,
+    REPRO_DEFAULTS,
+    build_label_mappings,
+    ensure_dataset_supports_ner,
+)
 from TModel import GlobalPointer, MetricsCalculator
 
 
@@ -55,8 +63,8 @@ class FGM(object):
 def parse_args():
     parser = argparse.ArgumentParser(description="边界感知 GlobalPointer 训练脚本")
     parser.add_argument("--model_path", default=PAPER_EXPLICIT_SETTINGS["model_path"], help="预训练模型目录，或 HuggingFace 模型名")
-    parser.add_argument("--train_path", default=r"./CMeEE-V2/CMeEE-V2_train.json", help="训练集路径")
-    parser.add_argument("--eval_path", default=r"./CMeEE-V2/CMeEE-V2_dev.json", help="验证集路径")
+    parser.add_argument("--train_path", default=ACTIVE_DATASET_CONFIG["train_path"], help="训练集路径")
+    parser.add_argument("--eval_path", default=ACTIVE_DATASET_CONFIG["eval_path"], help="验证集路径")
     parser.add_argument("--output_path", default="./outputs/ent_model.pth", help="模型权重输出路径")
     parser.add_argument("--batch_size", type=int, default=REPRO_DEFAULTS["batch_size"], help="batch size")
     parser.add_argument("--epochs", type=int, default=REPRO_DEFAULTS["epochs"], help="训练轮数")
@@ -158,11 +166,13 @@ def calculate_consistency_loss(logits, start_logits, end_logits, attention_mask)
     return loss.sum() / normalizer
 
 
-def build_dataloader(data, tokenizer, args, shuffle, is_train=False):
+def build_dataloader(data, tokenizer, ent2id, args, shuffle, is_train=False):
     dataset = EntDataset(
         data,
         tokenizer=tokenizer,
+        ent2id=ent2id,
         max_len=args.max_len,
+        istrain=True,
         use_entity_replace_aug=is_train and args.use_entity_replace_aug,
         entity_replace_prob=args.entity_replace_prob,
     )
@@ -175,7 +185,7 @@ def build_dataloader(data, tokenizer, args, shuffle, is_train=False):
     )
 
 
-def build_model(args, device):
+def build_model(args, device, ent2id):
     encoder = BertModel.from_pretrained(args.model_path, use_safetensors=False)#默认769维
     model = GlobalPointer(
         encoder=encoder,
@@ -361,7 +371,7 @@ def get_peak_memory_text(device):
     return f"{torch.cuda.max_memory_allocated(device) / 1024 / 1024:.2f} MB"
 
 
-def evaluate_model(model, eval_loader, entity_frequency, args, device, fold_index, epoch_index):
+def evaluate_model(model, eval_loader, entity_frequency, args, device, fold_index, epoch_index, id2ent):
     metrics = MetricsCalculator()
     metric_counter = create_metric_counter()
     total_eval_f1 = 0.0
@@ -393,8 +403,19 @@ def evaluate_model(model, eval_loader, entity_frequency, args, device, fold_inde
             total_eval_precision += eval_precision.item()
             total_eval_recall += eval_recall.item()
 
-            pred_entities_batch = decode_entities_from_logits(logits, raw_text_list, offset_mappings, args.prediction_threshold)
-            true_entities_batch = decode_entities_from_labels(labels, raw_text_list, offset_mappings)
+            pred_entities_batch = decode_entities_from_logits(
+                logits,
+                raw_text_list,
+                offset_mappings,
+                args.prediction_threshold,
+                id2ent,
+            )
+            true_entities_batch = decode_entities_from_labels(
+                labels,
+                raw_text_list,
+                offset_mappings,
+                id2ent,
+            )
             for pred_entities, true_entities in zip(pred_entities_batch, true_entities_batch):
                 update_metric_counter(
                     metric_counter,
@@ -465,7 +486,7 @@ def evaluate_model(model, eval_loader, entity_frequency, args, device, fold_inde
     }
 
 
-def train_one_fold(train_data, eval_data, tokenizer, args, device, fold_index=None):
+def train_one_fold(train_data, eval_data, tokenizer, args, device, ent2id, id2ent, fold_index=None):
     '''Args:
         fold_index: 当前折索引，从 0 开始，如果不使用 kfold 则为 None
         train_data: 当前折的训练数据列表，每条数据是一个 dict，包含 "text" 和 "entities" 字段
@@ -476,9 +497,9 @@ def train_one_fold(train_data, eval_data, tokenizer, args, device, fold_index=No
     train_data = sample_fewshot_data(train_data, args.fewshot_ratio, args.fewshot_seed + (fold_index or 0))
     entity_frequency = build_entity_frequency(train_data)
 
-    train_loader = build_dataloader(train_data, tokenizer, args, shuffle=True, is_train=True)
-    eval_loader = build_dataloader(eval_data, tokenizer, args, shuffle=False, is_train=False)
-    model = build_model(args, device)
+    train_loader = build_dataloader(train_data, tokenizer, ent2id, args, shuffle=True, is_train=True)
+    eval_loader = build_dataloader(eval_data, tokenizer, ent2id, args, shuffle=False, is_train=False)
+    model = build_model(args, device, ent2id)
     adversarial_trainer = build_adversarial_trainer(model, args)
     optimizer, scheduler = build_optimizer_and_scheduler(model, train_loader, args)
     save_path = build_fold_output_path(args.output_path, fold_index or 0, args.use_kfold)
@@ -582,6 +603,7 @@ def train_one_fold(train_data, eval_data, tokenizer, args, device, fold_index=No
             device,
             fold_index,
             epoch_index,
+            id2ent,
         )
 
         f1_improved = eval_result["overall_f1"] > best_eval_result["overall_f1"] + args.early_stopping_min_delta
@@ -619,6 +641,8 @@ def train_one_fold(train_data, eval_data, tokenizer, args, device, fold_index=No
 
 def main():
     args = parse_args()
+    dataset_config = ensure_dataset_supports_ner(ACTIVE_DATASET_CONFIG)
+    ent2id, id2ent = build_label_mappings(dataset_config)
     set_seed(args.seed)
     device = build_device(args.device)
     run_id = build_run_id()
@@ -626,8 +650,11 @@ def main():
 
     print(f"论文来源：{PAPER_META['title']}")
     print(f"论文 PDF：{PAPER_META['pdf_path']}")
+    print(f"当前活动数据集：{ACTIVE_DATASET}")
     print(f"当前实验编号：{run_id}")
     print(f"当前训练主干：{args.model_path}")
+    print(f"当前数据集任务类型：{dataset_config['task_type']}")
+    print(f"当前数据集标签数：{len(ent2id)}")
     print(f"当前 5 折交叉验证：{args.use_kfold}，折数 = {args.num_folds}")
     print(f"当前 batch_size：{args.batch_size}")
     print(f"当前 max_len：{args.max_len}")
@@ -660,12 +687,12 @@ def main():
     if args.use_kfold:
         print(f"开始读取训练集：{args.train_path}")
         start_time = time.time()
-        train_data = load_data(args.train_path)
+        train_data = load_data(args.train_path, dataset_config, ent2id)
         print(f"训练集读取完成，共 {len(train_data)} 条，耗时 {time.time() - start_time:.2f} 秒")
 
         print(f"开始读取验证集：{args.eval_path}")
         start_time = time.time()
-        eval_data = load_data(args.eval_path) if args.eval_path and os.path.exists(args.eval_path) else []
+        eval_data = load_data(args.eval_path, dataset_config, ent2id) if args.eval_path and os.path.exists(args.eval_path) else []
         print(f"验证集读取完成，共 {len(eval_data)} 条，耗时 {time.time() - start_time:.2f} 秒")
 
         labeled_data = train_data + eval_data
@@ -680,7 +707,7 @@ def main():
             fold_train_data = [sample for index, sample in enumerate(labeled_data) if index not in eval_index_set]
             fold_eval_data = [sample for index, sample in enumerate(labeled_data) if index in eval_index_set]
             print(f"\n========== Fold {fold_index + 1}/{args.num_folds} ==========")
-            best_result = train_one_fold(fold_train_data, fold_eval_data, tokenizer, args, device, fold_index)
+            best_result = train_one_fold(fold_train_data, fold_eval_data, tokenizer, args, device, ent2id, id2ent, fold_index)
             fold_best_scores.append(best_result)
 
         avg_best_f1 = sum(item["overall_f1"] for item in fold_best_scores) / len(fold_best_scores)
@@ -707,9 +734,9 @@ def main():
             "avg_best_f1": round(avg_best_f1, 6),
         }
     else:
-        train_data = load_data(args.train_path)
-        eval_data = load_data(args.eval_path)
-        best_result = train_one_fold(train_data, eval_data, tokenizer, args, device)
+        train_data = load_data(args.train_path, dataset_config, ent2id)
+        eval_data = load_data(args.eval_path, dataset_config, ent2id)
+        best_result = train_one_fold(train_data, eval_data, tokenizer, args, device, ent2id, id2ent)
         print(
             f"\n单次训练完成，最佳 Epoch：{best_result['best_epoch']}，"
             f"最佳 Precision：{best_result['overall_precision']:.4f}，"
