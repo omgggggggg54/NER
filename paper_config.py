@@ -113,8 +113,12 @@ REPRO_DEFAULTS = {
     "use_boundary_head": True,
     # 边界头 BCE 损失权重；仅 use_boundary_head=True 时有效。
     "boundary_loss_weight": 1.0,
-    # span 主任务和边界头一致性损失权重；仅边界头开启时有效。
-    "consistency_loss_weight": 0.2,
+    # 是否启用 MCN 式 co-energy 对齐损失。
+    "use_mcn_alignment": True,
+    # MCN 对齐损失权重；默认较小，避免辅助目标压过 span 主任务。
+    "mcn_alignment_loss_weight": 0.1,
+    # MCN attention 温度系数。
+    "mcn_alignment_temperature": 1.0,
     # 边界头预测分数加回 span logits 时的缩放系数。
     "boundary_bias_scale": 0.25,
     # 是否启用 TSBECL 公式(15)-(19)的 GRU head/tail 边界融合。

@@ -79,7 +79,9 @@ def parse_args():
     parser.add_argument("--hidden_size", type=int, default=REPRO_DEFAULTS["hidden_size"], help="隐藏层维度")
     parser.add_argument("--inner_dim", type=int, default=REPRO_DEFAULTS["inner_dim"], help="GlobalPointer 内部维度")
     parser.add_argument("--boundary_loss_weight", type=float, default=REPRO_DEFAULTS["boundary_loss_weight"], help="边界损失权重")
-    parser.add_argument("--consistency_loss_weight", type=float, default=REPRO_DEFAULTS["consistency_loss_weight"], help="一致性损失权重")
+    parser.add_argument("--use_mcn_alignment", action=argparse.BooleanOptionalAction, default=REPRO_DEFAULTS["use_mcn_alignment"], help="是否启用 MCN 式 co-energy 对齐")
+    parser.add_argument("--mcn_alignment_loss_weight", type=float, default=REPRO_DEFAULTS["mcn_alignment_loss_weight"], help="MCN 对齐损失权重")
+    parser.add_argument("--mcn_alignment_temperature", type=float, default=REPRO_DEFAULTS["mcn_alignment_temperature"], help="MCN 对齐 attention 温度")
     parser.add_argument("--boundary_bias_scale", type=float, default=REPRO_DEFAULTS["boundary_bias_scale"], help="边界偏置缩放系数")
     parser.add_argument("--use_tsbecl_boundary_fusion", action=argparse.BooleanOptionalAction, default=REPRO_DEFAULTS["use_tsbecl_boundary_fusion"], help="是否启用 TSBECL GRU head/tail 边界融合")
     parser.add_argument("--tsbecl_boundary_gru_layers", type=int, default=REPRO_DEFAULTS["tsbecl_boundary_gru_layers"], help="TSBECL 边界 GRU 层数")
@@ -153,17 +155,23 @@ def calculate_boundary_loss(start_logits, end_logits, start_labels, end_labels, 
     return ((start_loss + end_loss) * mask).sum() / normalizer#算平均损失
 
 
-def calculate_consistency_loss(logits, start_logits, end_logits, attention_mask):
-    mask = attention_mask.float()
-    start_from_span = logits.max(dim=1).values.max(dim=-1).values#[B, L],[b, i] = 第 b 个样本中，token i 作为起点时，所有实体类型、所有终点中的最高 span 得分。
-    end_from_span = logits.max(dim=1).values.max(dim=-2).values#[B, L],[b, j] = token j 作为终点时，所有类型、所有起点中的最佳 span 得分。
-    start_target = torch.sigmoid(start_from_span.detach())
-    end_target = torch.sigmoid(end_from_span.detach())
-    start_pred = torch.sigmoid(start_logits)
-    end_pred = torch.sigmoid(end_logits)
-    normalizer = torch.clamp(mask.sum(), min=1.0)
-    loss = ((start_pred - start_target) ** 2 + (end_pred - end_target) ** 2) * mask#用均方误差（MSE）衡量边界头和主任务的距离
-    return loss.sum() / normalizer
+def calculate_mcn_alignment_loss(model, outputs, attention_mask):
+    '''计算 MCN 式 co-energy 对齐损失。
+
+    这里不再使用旧的 MSE consistency，而是让边界注意力和 span 注意力在 token 相似矩阵上对齐。
+    '''
+    if not hasattr(model, "mcn_alignment"):
+        return outputs["logits"].new_tensor(0.0)
+    if outputs["boundary_hidden"] is None or outputs["start_logits"] is None or outputs["end_logits"] is None:
+        return outputs["logits"].new_tensor(0.0)
+    return model.mcn_alignment(
+        outputs["boundary_hidden"],
+        outputs["context_hidden"],
+        outputs["start_logits"],
+        outputs["end_logits"],
+        outputs["logits"],
+        attention_mask,
+    )
 
 
 def build_dataloader(data, tokenizer, ent2id, args, shuffle, is_train=False):
@@ -198,6 +206,8 @@ def build_model(args, device, ent2id):
         use_tsbecl_boundary_fusion=args.use_tsbecl_boundary_fusion,
         tsbecl_boundary_gru_layers=args.tsbecl_boundary_gru_layers,
         tsbecl_boundary_dropout=args.tsbecl_boundary_dropout,
+        use_mcn_alignment=args.use_mcn_alignment,
+        mcn_alignment_temperature=args.mcn_alignment_temperature,
     ).to(device)
     return model
 
@@ -229,7 +239,7 @@ def build_optimizer_and_scheduler(model, train_loader, args):
 
 
 def compute_total_batch_loss(model, input_ids, attention_mask, segment_ids, labels, args):
-    '''统一封装主任务、边界头和一致性损失，方便正常训练和对抗训练复用同一套口径。'''
+    '''统一封装主任务、边界头和 MCN 对齐损失，方便正常训练和对抗训练复用同一套口径。'''
     outputs = model(
         input_ids,
         attention_mask,
@@ -239,7 +249,7 @@ def compute_total_batch_loss(model, input_ids, attention_mask, segment_ids, labe
     logits = outputs["logits"]
     total_batch_loss = span_loss(labels.float(), logits.float())
     boundary_loss = logits.new_tensor(0.0)
-    consistency_loss = logits.new_tensor(0.0)
+    mcn_alignment_loss = logits.new_tensor(0.0)
 
     if args.use_boundary_head and outputs["start_logits"] is not None and outputs["end_logits"] is not None:
         start_labels, end_labels = generate_boundary_labels(labels)
@@ -250,18 +260,14 @@ def compute_total_batch_loss(model, input_ids, attention_mask, segment_ids, labe
             end_labels,
             attention_mask,
         )
-        consistency_loss = calculate_consistency_loss(
-            logits,
-            outputs["start_logits"],
-            outputs["end_logits"],
-            attention_mask,
-        )
+        if args.use_mcn_alignment:
+            mcn_alignment_loss = calculate_mcn_alignment_loss(model, outputs, attention_mask)
         total_batch_loss = (
             total_batch_loss
             + args.boundary_loss_weight * boundary_loss
-            + args.consistency_loss_weight * consistency_loss
+            + args.mcn_alignment_loss_weight * mcn_alignment_loss
         )
-    return total_batch_loss, outputs, boundary_loss, consistency_loss
+    return total_batch_loss, outputs, boundary_loss, mcn_alignment_loss
 
 
 def summarize_module_status(args):
@@ -278,6 +284,8 @@ def summarize_module_status(args):
         "早停min_delta": args.early_stopping_min_delta if args.use_early_stopping else "off",
         "TSBECL边界融合": args.use_tsbecl_boundary_fusion,
         "TSBECL边界GRU层数": args.tsbecl_boundary_gru_layers if args.use_tsbecl_boundary_fusion else "off",
+        "MCN对齐": args.use_mcn_alignment,
+        "MCN对齐权重": args.mcn_alignment_loss_weight if args.use_mcn_alignment else "off",
         "对抗训练": args.use_adversarial,
         "对抗模式": "fgm" if args.use_adversarial else "off",
         "同类实体替换增强": args.use_entity_replace_aug,
@@ -520,7 +528,7 @@ def train_one_fold(train_data, eval_data, tokenizer, args, device, ent2id, id2en
         total_precision = 0.0
         total_recall = 0.0
         total_boundary_loss = 0.0
-        total_consistency_loss = 0.0
+        total_mcn_alignment_loss = 0.0
         total_adversarial_loss = 0.0
         model.train()
         if device.type == "cuda":
@@ -534,7 +542,7 @@ def train_one_fold(train_data, eval_data, tokenizer, args, device, ent2id, id2en
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            total_batch_loss, outputs, boundary_loss, consistency_loss = compute_total_batch_loss(
+            total_batch_loss, outputs, boundary_loss, mcn_alignment_loss = compute_total_batch_loss(
                 model,
                 input_ids,
                 attention_mask,
@@ -575,7 +583,7 @@ def train_one_fold(train_data, eval_data, tokenizer, args, device, ent2id, id2en
             total_precision += sample_precision.item()
             total_recall += sample_recall.item()
             total_boundary_loss += boundary_loss.item()
-            total_consistency_loss += consistency_loss.item()
+            total_mcn_alignment_loss += mcn_alignment_loss.item()
             total_adversarial_loss += adversarial_loss.item()
 
             if (batch_index + 1) % 10 == 0:
@@ -584,14 +592,14 @@ def train_one_fold(train_data, eval_data, tokenizer, args, device, ent2id, id2en
                 avg_precision = total_precision / (batch_index + 1)
                 avg_recall = total_recall / (batch_index + 1)
                 avg_boundary_loss = total_boundary_loss / (batch_index + 1)
-                avg_consistency_loss = total_consistency_loss / (batch_index + 1)
+                avg_mcn_alignment_loss = total_mcn_alignment_loss / (batch_index + 1)
                 avg_adversarial_loss = total_adversarial_loss / (batch_index + 1)
                 print(
                     f"Fold {fold_index + 1 if fold_index is not None else 1}, "
                     f"Epoch {epoch_index + 1}/{args.epochs}, Batch {batch_index + 1}/{len(train_loader)}, "
                     f"Train Loss: {avg_loss:.4f}, Train Precision: {avg_precision:.4f}, "
                     f"Train Recall: {avg_recall:.4f}, Train F1: {avg_f1:.4f}, "
-                    f"Boundary Loss: {avg_boundary_loss:.4f}, Consistency Loss: {avg_consistency_loss:.4f}, "
+                    f"Boundary Loss: {avg_boundary_loss:.4f}, MCN Align Loss: {avg_mcn_alignment_loss:.4f}, "
                     f"Adv Loss: {avg_adversarial_loss:.4f}"
                 )
 
@@ -666,6 +674,9 @@ def main():
     print(f"当前 adversarial：{args.use_adversarial}")
     print("当前对抗模式：fgm")
     print(f"当前 TSBECL边界融合：{args.use_tsbecl_boundary_fusion}")
+    print(f"当前 MCN对齐：{args.use_mcn_alignment}")
+    print(f"当前 MCN对齐权重：{args.mcn_alignment_loss_weight if args.use_mcn_alignment else 'off'}")
+    print(f"当前 MCN温度：{args.mcn_alignment_temperature if args.use_mcn_alignment else 'off'}")
     print(f"当前 lr：{args.lr}")
     print(f"当前 use_entity_replace_aug：{args.use_entity_replace_aug}")
     print(f"当前 entity_replace_prob：{args.entity_replace_prob}")

@@ -1,6 +1,57 @@
 # -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MCNAlignment(nn.Module):
+    '''MCN co-energy 思想的 token 对齐层。
+
+    原 MCN 用 segmentation attention 和 detection attention 做 co-energy 最大化。
+    这里迁移成：边界 token 注意力 与 span token 注意力 在 token 相似矩阵上对齐。
+    '''
+
+    def __init__(self, temperature=1.0, eps=1e-6):
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+
+    def forward(self, boundary_hidden, context_hidden, start_logits, end_logits, span_logits, attention_mask):
+        '''计算边界分支和 span 分支的 co-energy。
+
+        Args:
+            boundary_hidden: [B, L, H]，边界 GRU 得到的 token 表示。
+            context_hidden: [B, L, H]，GlobalPointer 使用的 token 表示。
+            start_logits/end_logits: [B, L]，边界头输出。
+            span_logits: [B, E, L, L]，GlobalPointer span 打分。
+            attention_mask: [B, L]，有效 token mask。
+        '''
+        mask = attention_mask.bool()
+        very_negative = -1e12
+
+        # 边界注意力来自起点/终点分数，表示“哪些 token 像实体边界”。
+        boundary_scores = (start_logits + end_logits) / max(self.temperature, self.eps)
+        boundary_scores = boundary_scores.masked_fill(~mask, very_negative)
+        boundary_attention = torch.softmax(boundary_scores, dim=-1)
+
+        # span 注意力从四维 span 矩阵反推到 token，表示“哪些 token 被主任务认为属于实体区域”。
+        span_scores = span_logits.detach().max(dim=1).values
+        token_scores = torch.maximum(span_scores.max(dim=-1).values, span_scores.max(dim=-2).values)
+        token_scores = (token_scores / max(self.temperature, self.eps)).masked_fill(~mask, very_negative)
+        span_attention = torch.softmax(token_scores, dim=-1)
+
+        boundary_norm = F.normalize(boundary_hidden, p=2, dim=-1)
+        context_norm = F.normalize(context_hidden.detach(), p=2, dim=-1)
+        token_similarity = torch.matmul(boundary_norm, context_norm.transpose(1, 2))
+        token_similarity = (token_similarity + 1.0) * 0.5
+
+        pair_mask = mask.unsqueeze(1) & mask.unsqueeze(2)
+        token_similarity = token_similarity.masked_fill(~pair_mask, 0.0)
+        co_energy = torch.bmm(boundary_attention.unsqueeze(1), token_similarity)
+        co_energy = torch.bmm(co_energy, span_attention.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        return -torch.log(co_energy.clamp_min(self.eps)).mean()
+
+
 class TSBECLBoundaryFusion(nn.Module):
     '''TSBECL 论文公式(15)-(19)的 GRU 边界表示融合层。
 
@@ -44,7 +95,8 @@ class TSBECLBoundaryFusion(nn.Module):
             + self.tail_fusion(tail_hidden)
             + self.context_fusion(hidden_states)
         )
-        return start_logits, end_logits, fused_hidden
+        boundary_hidden = 0.5 * (head_hidden + tail_hidden)
+        return start_logits, end_logits, fused_hidden, boundary_hidden
 
 
 class MetricsCalculator(object):
@@ -129,6 +181,8 @@ class GlobalPointer(nn.Module):
         use_tsbecl_boundary_fusion=False,
         tsbecl_boundary_gru_layers=1,
         tsbecl_boundary_dropout=0.1,
+        use_mcn_alignment=False,
+        mcn_alignment_temperature=1.0,
     ):
         super().__init__()
         self.encoder = encoder
@@ -139,6 +193,7 @@ class GlobalPointer(nn.Module):
         self.use_boundary_head = use_boundary_head
         self.boundary_bias_scale = boundary_bias_scale
         self.use_tsbecl_boundary_fusion = use_tsbecl_boundary_fusion
+        self.use_mcn_alignment = use_mcn_alignment
 
         self.dense = nn.Linear(self.hidden_size, self.ent_type_size * self.inner_dim * 2)
         if use_boundary_head:
@@ -151,6 +206,8 @@ class GlobalPointer(nn.Module):
             else:
                 self.start_classifier = nn.Linear(self.hidden_size, 1)
                 self.end_classifier = nn.Linear(self.hidden_size, 1)
+        if use_mcn_alignment:
+            self.mcn_alignment = MCNAlignment(temperature=mcn_alignment_temperature)
 
     def sinusoidal_position_embedding(self, batch_size, seq_len, output_dim, device):
         '''生成 RoPE 所需的位置编码。'''
@@ -210,15 +267,18 @@ class GlobalPointer(nn.Module):
         这里直接收口为主链真实需要的三个输入，避免外部脚本继续传历史残留参数。
         '''
         context_outputs = self.encoder(input_ids, attention_mask, token_type_ids)
-        last_hidden_state = context_outputs[0]
+        context_hidden = context_outputs[0]
+        last_hidden_state = context_hidden
 
         start_logits, end_logits = None, None
+        boundary_hidden = None
         if self.use_boundary_head:
             if self.use_tsbecl_boundary_fusion:
-                start_logits, end_logits, last_hidden_state = self.boundary_fusion(last_hidden_state)
+                start_logits, end_logits, last_hidden_state, boundary_hidden = self.boundary_fusion(last_hidden_state)
             else:
                 start_logits = self.start_classifier(last_hidden_state).squeeze(-1)#[B,L]
                 end_logits = self.end_classifier(last_hidden_state).squeeze(-1)#[B,L]
+                boundary_hidden = last_hidden_state
 
         # 最终打分保持原版 GlobalPointer 点积口径，保证主预测头足够稳定。
         logits = self.compute_span_logits(last_hidden_state, input_ids)
@@ -235,4 +295,7 @@ class GlobalPointer(nn.Module):
             "logits": logits,
             "start_logits": start_logits,
             "end_logits": end_logits,
+            "boundary_hidden": boundary_hidden,
+            "context_hidden": last_hidden_state,
+            "encoder_hidden": context_hidden,
         }
